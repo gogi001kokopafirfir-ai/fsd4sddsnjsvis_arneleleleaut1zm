@@ -13,7 +13,7 @@ if not lp then warn("SpawnModel: no LocalPlayer") return end
 -- =======================
 -- Настройки (редактируйте здесь)
 -- =======================
-local ASSET_ID = "rbxassetid://85617897942381"  -- <-- поставьте нужный rbxassetid://...
+local ASSET_ID = "rbxassetid://134769181535897"  -- <-- поставьте нужный rbxassetid://...
 local SPAWN_DISTANCE = 6                         -- от игрока по направлению взгляда (studs)
 local SPAWN_HEIGHT_ABOVE = 6                     -- высота над землёй для начального луча (studs)
 local DROP_RAY_LENGTH = 200                      -- насколько вниз кастить луч для поиска земли
