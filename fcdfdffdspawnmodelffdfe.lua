@@ -1,137 +1,135 @@
--- spawn-fixed-castle.lua  (LocalScript, injector)
--- Спавнит модель (замок) по фиксированным координатам (локально для игрока).
--- Конфигурация вверху: поменяй ASSET_ID, FIXED_POSITION, ROTATION_DEG, ANCHOR_PLACED_MODEL, ALIGN_TO_GROUND.
+-- watch-model-position.lua  (LocalScript, injector)
+-- Наблюдает за моделью в workspace по имени и печатает позицию/ориентацию при изменениях.
 
-local workspace = game:GetService("Workspace")
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
 
--- ========================
--- = Настройки (редактируйте) =
--- ========================
-local ASSET_ID = "rbxassetid://128743514073638" -- <-- ID замка
--- Начальное фиксированное место (по умолчанию — центр карты). Меняйте на нужные координаты.
-local FIXED_POSITION = Vector3.new(0, 5, 0)      -- X, Y, Z (Y = высота, можно потом подправить)
--- Ориентация (в градусах) — модель повернута относительно forward.
-local ROTATION_DEG = Vector3.new(0, 0, 0)       -- pitch, yaw, roll (deg)
-local ANCHOR_PLACED_MODEL = true                -- заанкерить модель после размещения (стабильность)
-local ALIGN_TO_GROUND = false                   -- если true: попытается подогнать низ модели по FIXED_POSITION.Y
--- Если ALIGN_TO_GROUND = true, то FIXED_POSITION.Y трактуется как абсолютная высота земли (низ модели будет на этой Y).
--- ========================
+-- === Настройки (редактируй) ===
+local MODEL_NAME = "Castle"         -- <- имя модели в Workspace (замени на своё)
+local POSITION_EPS = 0.001          -- минимальная дистанция (studs) для срабатывания
+local ROTATION_DEG_EPS = 0.5        -- минимальное изменение ориентации (градусы) для срабатывания
+local POLL_FALLBACK = true          -- включить резервный polling, если PropertyChanged не срабатывает
+local POLL_INTERVAL = 0.05          -- интервал polling в секундах
+-- ===============================
 
--- Утилиты
-local function uniqueName(base)
-    if not base or base == "" then base = "Model" end
-    local name = base
-    local i = 1
-    while workspace:FindFirstChild(name) do
-        i = i + 1
-        name = base .. tostring(i)
-    end
-    return name
+local function findModel()
+    return Workspace:FindFirstChild(MODEL_NAME)
 end
 
 local function findPrimaryPart(model)
-    if model.PrimaryPart and model.PrimaryPart:IsA("BasePart") then return model.PrimaryPart end
+    if not model then return nil end
+    if model.PrimaryPart and model.PrimaryPart:IsA("BasePart") then
+        return model.PrimaryPart
+    end
     return model:FindFirstChildWhichIsA("BasePart", true)
 end
 
-local function getLowestY(model)
-    local minY = math.huge
-    local found = false
-    for _,d in ipairs(model:GetDescendants()) do
-        if d:IsA("BasePart") then
-            found = true
-            local bottom = d.Position.Y - (d.Size.Y/2)
-            if bottom < minY then minY = bottom end
+local function cfToDegs(cf)
+    local x,y,z = cf:ToOrientation() -- радианы
+    return math.deg(x), math.deg(y), math.deg(z)
+end
+
+local function printCfInfo(prefix, cf)
+    local pos = cf.Position
+    local rx, ry, rz = cfToDegs(cf)
+    local ts = string.format("%.2f", tick())
+    print(("[WATCH] %s | t=%s | Pos=Vector3.new(%.6f, %.6f, %.6f) | RotDeg=Vector3.new(%.3f, %.3f, %.3f)"):format(prefix, ts, pos.X, pos.Y, pos.Z, rx, ry, rz))
+    -- удобный сниппет для вставки в spawn-скрипт:
+    print(("[SNIPPET] CFrame.new(%.6f, %.6f, %.6f) * CFrame.Angles(math.rad(%.6f), math.rad(%.6f), math.rad(%.6f))"):format(
+        pos.X, pos.Y, pos.Z, rx, ry, rz))
+end
+
+-- сравнение поз/ротаций
+local function hasSignificantChange(lastPos, lastRotDeg, newPos, newRotDeg)
+    if not lastPos or not lastRotDeg then return true end
+    if (newPos - lastPos).Magnitude > POSITION_EPS then return true end
+    local dx = math.abs(newRotDeg.X - lastRotDeg.X)
+    local dy = math.abs(newRotDeg.Y - lastRotDeg.Y)
+    local dz = math.abs(newRotDeg.Z - lastRotDeg.Z)
+    if dx > ROTATION_DEG_EPS or dy > ROTATION_DEG_EPS or dz > ROTATION_DEG_EPS then return true end
+    return false
+end
+
+-- основной наблюдатель
+do
+    local model = findModel()
+    if not model then
+        warn(("watch-model-position: модель '%s' не найдена в workspace. Проверь MODEL_NAME."):format(MODEL_NAME))
+    end
+
+    local primary = model and findPrimaryPart(model)
+    local lastPos, lastRotDeg = nil, nil
+    local propConn = nil
+    local pollAcc = 0
+
+    local function handleCF(cf)
+        if not cf then return end
+        local pos = cf.Position
+        local rx, ry, rz = cfToDegs(cf)
+        local newRot = Vector3.new(rx, ry, rz)
+        if hasSignificantChange(lastPos, lastRotDeg, pos, newRot) then
+            printCfInfo(model and model.Name or MODEL_NAME, cf)
+            lastPos = pos
+            lastRotDeg = newRot
         end
     end
-    return found and minY or nil
-end
 
-local function spawnAssetById(assetIdStr)
-    if not assetIdStr or assetIdStr == "" then
-        warn("spawn-fixed: empty asset id")
-        return nil
-    end
-    local ok, objs = pcall(function() return game:GetObjects(assetIdStr) end)
-    if not ok or not objs or #objs == 0 then
-        warn("spawn-fixed: GetObjects failed for", assetIdStr)
-        return nil
-    end
-    -- клонируем загруженный объект (обычно objs[1] — Model)
-    local model = objs[1]:Clone()
-    return model
-end
-
-local function placeModelAt(model, posVec3, rotationDeg, anchorPlaced, alignToGround)
-    if not model then return end
-    -- сбор PrimaryPart
-    local prim = findPrimaryPart(model)
-    if prim then model.PrimaryPart = prim end
-
-    -- вычисляем желаемую CFrame
-    local rot = CFrame.Angles(math.rad(rotationDeg.X), math.rad(rotationDeg.Y), math.rad(rotationDeg.Z))
-
-    if alignToGround then
-        -- если можем определить lowestY модели — поднимем/опустим так, чтобы низ совпал с posVec3.Y
-        local lowest = getLowestY(model)
-        if lowest and prim then
-            local delta = prim.Position.Y - lowest -- от primary до низа
-            local desiredY = posVec3.Y + delta
-            local basePos = Vector3.new(posVec3.X, desiredY, posVec3.Z)
-            local baseCFrame = CFrame.new(basePos) * rot
-            pcall(function()
-                -- временно parent чтобы SetPrimaryPartCFrame работал корректно
-                if not model.Parent then model.Parent = workspace end
-                model:SetPrimaryPartCFrame(baseCFrame)
+    local function attachToPrimary(p)
+        if not p then return end
+        -- initial snapshot
+        pcall(function() handleCF(p.CFrame) end)
+        -- disconnect old
+        if propConn then pcall(function() propConn:Disconnect() end) end
+        -- try property changed signal
+        local ok, conn = pcall(function() return p:GetPropertyChangedSignal("CFrame") end)
+        if ok and conn then
+            propConn = conn:Connect(function()
+                pcall(function() handleCF(p.CFrame) end)
             end)
+            print("[watch-model] connected to PrimaryPart:GetPropertyChangedSignal('CFrame')")
         else
-            -- fallback: ставим primary в posVec3
-            if prim then
-                pcall(function() prim.CFrame = CFrame.new(posVec3) * rot end)
-            else
-                pcall(function() model:SetPrimaryPartCFrame(CFrame.new(posVec3) * rot) end)
+            propConn = nil
+            print("[watch-model] property signal unavailable; will rely on polling fallback")
+        end
+    end
+
+    if primary then
+        attachToPrimary(primary)
+    end
+
+    -- RenderStepped polling as fallback + auto reattach if model/primary changes
+    local lastModelRef = model
+    RunService.RenderStepped:Connect(function(dt)
+        -- auto-find model if it's not found or was replaced
+        model = model or findModel()
+        if model ~= lastModelRef then
+            lastModelRef = model
+            primary = findPrimaryPart(model)
+            if propConn then pcall(function() propConn:Disconnect() end); propConn = nil end
+            lastPos, lastRotDeg = nil, nil
+            if model then
+                print("[watch-model] detected model added/changed:", model.Name)
+            end
+            if primary then
+                attachToPrimary(primary)
             end
         end
-    else
-        -- строго по FIXED_POSITION: primary в posVec3 (ориентация применяется)
-        if prim then
-            pcall(function() prim.CFrame = CFrame.new(posVec3) * rot end)
-        else
-            pcall(function() model:SetPrimaryPartCFrame(CFrame.new(posVec3) * rot) end)
-        end
-    end
 
-    -- Anchor / physics tweak
-    for _, part in ipairs(model:GetDescendants()) do
-        if part:IsA("BasePart") then
-            pcall(function()
-                part.Anchored = anchorPlaced
-                if anchorPlaced and part.AssemblyLinearVelocity then
-                    part.AssemblyLinearVelocity = Vector3.new(0,0,0)
-                    part.AssemblyAngularVelocity = Vector3.new(0,0,0)
-                end
-            end)
+        if primary and propConn then
+            -- property-driven path already handles changes
+            return
         end
-    end
+
+        -- polling fallback
+        if POLL_FALLBACK and primary then
+            pollAcc = pollAcc + dt
+            if pollAcc >= POLL_INTERVAL then
+                pollAcc = 0
+                local ok, cf = pcall(function() return primary.CFrame end)
+                if ok and cf then handleCF(cf) end
+            end
+        end
+    end)
 end
 
--- Main: spawn once (без клавиш)
-local function spawnFixed()
-    local model = spawnAssetById(ASSET_ID)
-    if not model then return end
-
-    -- имя — используем имя модели из ассета, но делаем уникальным
-    local baseName = model.Name or "Castle"
-    local finalName = uniqueName(baseName)
-    model.Name = finalName
-
-    -- parent в workspace (до позиционирования — чтобы SetPrimaryPartCFrame работал)
-    model.Parent = workspace
-
-    placeModelAt(model, FIXED_POSITION, ROTATION_DEG, ANCHOR_PLACED_MODEL, ALIGN_TO_GROUND)
-
-    print(("spawn-fixed: spawned '%s' at (%.1f, %.1f, %.1f)"):format(finalName, FIXED_POSITION.X, FIXED_POSITION.Y, FIXED_POSITION.Z))
-end
-
--- Запуск
-spawnFixed()
+print("[watch-model] ready. Отслеживает модель: " .. tostring(MODEL_NAME))
