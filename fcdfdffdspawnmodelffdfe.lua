@@ -1,142 +1,129 @@
--- spawn-castle-fixed.lua (LocalScript)
--- Лёгкий стабильный спавн модели (замок) по фиксированным координатам/углам.
--- Настройки вверху — правь только их.
+-- spawn_castle_fixed_simple.lua  (LocalScript, injector)
+-- Спавнит модель (замок) по фиксированным координатам + опционально анкерит.
+-- ID и координаты вверху — меняй при необходимости.
 
 local Workspace = game:GetService("Workspace")
-local RunService = game:GetService("RunService")
 
--- ====== Настройки (редактируй) ======
-local ASSET_ID       = "rbxassetid://128743514073638"   -- id замка
-local SPAWN_POS      = Vector3.new(-28.000, 15.000, -4.000)
-local SPAWN_ROT_DEG  = Vector3.new(0, -90.000, 0)       -- (pitch, yaw, roll) в градусах
-local ANCHOR_PARTS   = true                             -- анкерить все BasePart в модели
-local ENABLE_MONITOR = false                            -- если true — будет печатать координаты модели
-local MONITOR_INTERVAL = 0.25                           -- сек (только если ENABLE_MONITOR=true)
--- ====================================
+-- ========== НАСТРОЙКИ ==========
+local ASSET_ID = "rbxassetid://128743514073638"  -- id замка
+local TARGET_POS = Vector3.new(-28.000, 15.000, -4.000) -- координаты (x,y,z)
+local TARGET_ROT_DEG = Vector3.new(0, -90.000, 0.000)   -- rotation (pitch,yaw,roll) в градусах
+local ANCHOR_PARTS = true    -- true -> ставим Anchored = true для всех BasePart'ов
+local ENABLE_MONITORING = false -- если true — печатает pos/rot модели в Output периодически
+local MONITOR_INTERVAL = 0.25
+-- =================================
 
 local function fmt(n) return string.format("%.3f", tonumber(n) or 0) end
 
-local function findAnyBasePart(m)
-    if not m then return nil end
-    if m.PrimaryPart and m.PrimaryPart:IsA("BasePart") then return m.PrimaryPart end
-    return m:FindFirstChildWhichIsA("BasePart", true)
-end
-
-local function cframeFromPosRot(pos, rotDeg)
-    local rot = CFrame.Angles(math.rad(rotDeg.X), math.rad(rotDeg.Y), math.rad(rotDeg.Z))
-    return CFrame.new(pos) * rot
-end
-
 local function uniqueName(base)
-    if not base or base == "" then base = "Model" end
+    base = (base and tostring(base) ~= "" and tostring(base)) or "Model"
     local name = base
     local i = 1
     while Workspace:FindFirstChild(name) do
         i = i + 1
-        name = base .. tostring(i)
+        name = base .. "_" .. tostring(i)
     end
     return name
 end
 
-local function spawnModel(assetId)
-    if not assetId or assetId == "" then
-        warn("spawn-castle: пустой assetId")
-        return nil
-    end
-    local ok, objs = pcall(function() return game:GetObjects(assetId) end)
-    if not ok or not objs or #objs == 0 then
-        warn("spawn-castle: не удалось загрузить asset:", assetId)
-        return nil
-    end
-    local model = objs[1]
-    if not model then return nil end
-    -- не менять исходный объект — клонируем
-    local clone = model:Clone()
-    clone.Name = uniqueName(model.Name or "Model")
-    return clone
+local function findPrimaryPart(model)
+    if model.PrimaryPart and model.PrimaryPart:IsA("BasePart") then return model.PrimaryPart end
+    return model:FindFirstChildWhichIsA("BasePart", true)
 end
 
-local function placeModel(model, targetCFrame, anchorParts)
-    if not model then return false end
-    -- ставим в Workspace чтобы методы работали
-    model.Parent = Workspace
+local function getModelCFrameForPlacement(model)
+    -- Возвращает CFrame для установки: PrimaryPart или GetBoundingBox()
+    if not model then return nil end
+    local ok, cf = pcall(function()
+        local prim = findPrimaryPart(model)
+        if prim then return prim.CFrame end
+        local bboxCf, _ = model:GetBoundingBox()
+        return bboxCf
+    end)
+    return ok and cf or nil
+end
 
-    -- если есть PrimaryPart/любая базовая часть, используем PivotTo (без необходимости присваивать PrimaryPart)
-    local ok, err = pcall(function()
-        if model:IsA("Model") then
-            if model.PrimaryPart then
-                model:SetPrimaryPartCFrame(targetCFrame)
-            else
-                -- PivotTo работает для моделей: ставим через :PivotTo
-                if model.PivotTo then
-                    model:PivotTo(targetCFrame)
-                else
-                    -- fallback: попытка установить CFrame для первой BasePart
-                    local part = findAnyBasePart(model)
-                    if part then
-                        part.CFrame = targetCFrame
-                    end
+local function setModelCFrame(model, desiredCFrame)
+    if not model or not desiredCFrame then return end
+    local prim = findPrimaryPart(model)
+    if prim then
+        pcall(function() model.PrimaryPart = prim end)
+        pcall(function() model:SetPrimaryPartCFrame(desiredCFrame) end)
+    else
+        -- fallback: move each BasePart relative to model's bounding center
+        local ok, bboxCf, size = pcall(function() return model:GetBoundingBox() end)
+        if ok and bboxCf then
+            local offset = desiredCFrame * bboxCf:Inverse()
+            for _, p in ipairs(model:GetDescendants()) do
+                if p:IsA("BasePart") then
+                    pcall(function() p.CFrame = offset * p.CFrame end)
                 end
             end
         end
-    end)
-    if not ok then
-        warn("spawn-castle: placement warning:", err)
+    end
+end
+
+local function spawnModelNow()
+    -- загрузка
+    local ok, objs = pcall(function() return game:GetObjects(ASSET_ID) end)
+    if not ok or not objs or #objs == 0 then
+        warn("spawn_castle: не удалось загрузить asset:", ASSET_ID)
+        return
     end
 
-    if anchorParts then
-        for _, d in ipairs(model:GetDescendants()) do
-            if d:IsA("BasePart") then
+    local model = objs[1]:Clone()
+    local baseName = model.Name or "Castle"
+    model.Name = uniqueName(baseName)
+    model.Parent = Workspace
+
+    -- собираем CFrame назначения
+    local rot = CFrame.Angles(math.rad(TARGET_ROT_DEG.X), math.rad(TARGET_ROT_DEG.Y), math.rad(TARGET_ROT_DEG.Z))
+    local desiredCf = CFrame.new(TARGET_POS) * rot
+
+    -- размещаем
+    setModelCFrame(model, desiredCf)
+
+    -- анкерим, обнуляем скорости (если нужно)
+    if ANCHOR_PARTS then
+        for _, p in ipairs(model:GetDescendants()) do
+            if p:IsA("BasePart") then
                 pcall(function()
-                    d.Anchored = true
-                    d.AssemblyLinearVelocity  = Vector3.new(0,0,0)
-                    d.AssemblyAngularVelocity = Vector3.new(0,0,0)
+                    p.Anchored = true
+                    if p.AssemblyLinearVelocity then p.AssemblyLinearVelocity = Vector3.new(0,0,0) end
+                    if p.AssemblyAngularVelocity then p.AssemblyAngularVelocity = Vector3.new(0,0,0) end
                 end)
             end
         end
     end
-    return true
-end
 
-local function startMonitor(model)
-    if not model or not ENABLE_MONITOR then return end
-    local lastCf = nil
-    local acc = 0
-    local conn
-    conn = RunService.Heartbeat:Connect(function(dt)
-        acc = acc + dt
-        if acc < MONITOR_INTERVAL then return end
-        acc = 0
-        local ok, cf = pcall(function()
-            if model.PrimaryPart then return model:GetPrimaryPartCFrame() end
-            if model:GetBoundingBox then local bcf, _ = model:GetBoundingBox() return bcf end
-            return nil
+    print(("spawn_castle: spawned '%s' at Pos=(%s,%s,%s) RotDeg=(%s,%s,%s)")
+        :format(model.Name, fmt(TARGET_POS.X), fmt(TARGET_POS.Y), fmt(TARGET_POS.Z),
+                fmt(TARGET_ROT_DEG.X), fmt(TARGET_ROT_DEG.Y), fmt(TARGET_ROT_DEG.Z))
+    )
+
+    -- опциональный мониторинг (необязательный)
+    if ENABLE_MONITORING then
+        local RunService = game:GetService("RunService")
+        local lastCf = getModelCFrameForPlacement(model)
+        local acc = 0
+        RunService.Heartbeat:Connect(function(dt)
+            acc = acc + dt
+            if acc < MONITOR_INTERVAL then return end
+            acc = 0
+            local cf = getModelCFrameForPlacement(model)
+            if cf then
+                local pos = cf.Position
+                local x,y,z = pos.X,pos.Y,pos.Z
+                local rx,ry,rz = cf:ToEulerAnglesXYZ()
+                print(string.format("MONITOR: Pos=(%s,%s,%s) RotDeg=(%s,%s,%s)",
+                    fmt(x),fmt(y),fmt(z),
+                    fmt(math.deg(rx)),fmt(math.deg(ry)),fmt(math.deg(rz))
+                ))
+            end
         end)
-        if not ok or not cf then
-            if conn then conn:Disconnect() end
-            print("spawn-castle: монитор остановлен (модель могла быть удалена)")
-            return
-        end
-        if not lastCf or (cf.Position - lastCf.Position).Magnitude > 0.01 then
-            local px,py,pz = cf.Position.X, cf.Position.Y, cf.Position.Z
-            local rx,ry,rz = cf:ToEulerAnglesXYZ()
-            print(("MODEL POS: (%s, %s, %s)  ROT_RAD=(%.3f, %.3f, %.3f)"):format(fmt(px),fmt(py),fmt(pz), rx,ry,rz))
-            lastCf = cf
-        end
-    end)
-    print("spawn-castle: монитор запущен")
+    end
+
+    return model
 end
 
--- === main
-local model = spawnModel(ASSET_ID)
-if not model then return end
-
-local targetCFrame = cframeFromPosRot(SPAWN_POS, SPAWN_ROT_DEG)
-local ok = placeModel(model, targetCFrame, ANCHOR_PARTS)
-if not ok then warn("spawn-castle: не удалось корректно разместить модель") end
-
-print(("spawn-castle: модель '%s' заспавнена на %s ; rotDeg=(%s,%s,%s)"):
-    format(model.Name, tostring(SPAWN_POS), fmt(SPAWN_ROT_DEG.X), fmt(SPAWN_ROT_DEG.Y), fmt(SPAWN_ROT_DEG.Z))
-)
-
-startMonitor(model)
+spawnModelNow()
